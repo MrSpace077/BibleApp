@@ -51,7 +51,7 @@ class BibleSearch:
         else:
             print(text)
 
-    def print_verse(self, reference: str, text: str, translation: str = "NIV"):
+    def print_verse(self, reference: str, text: str, translation: str = "WEB"):
         """Display a verse in a formatted way."""
         if self.console:
             panel = Panel(
@@ -68,6 +68,13 @@ class BibleSearch:
             print(text.strip())
             print(f"{'='*60}\n")
 
+    def print_error(self, message: str):
+        """Display an error message."""
+        if self.console:
+            self.console.print(f"[bold red]{message}[/bold red]")
+        else:
+            print(f"❌ {message}")
+
     def fetch_verse(self, reference: str, translation: str = "web") -> Optional[dict]:
         """
         Fetch a verse from the Bible API.
@@ -80,24 +87,80 @@ class BibleSearch:
             Dictionary with verse data or None if not found
         """
         try:
-            # Clean up the reference
             reference = reference.strip()
             url = f"{BIBLE_API_URL}/{reference}"
-
             params = {"translation": translation}
             response = requests.get(url, params=params, timeout=10)
 
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                # Check if verse actually exists
+                if "error" not in data and data.get("text"):
+                    return data
+                return None
             else:
                 return None
-        except Exception as e:
-            self.print(f"[red]Error fetching verse: {e}[/red]" if RICH_AVAILABLE else f"Error fetching verse: {e}")
+        except Exception:
             return None
 
-    def search_with_ai(self, query: str) -> list[dict]:
+    def search_single_with_ai(self, query: str) -> Optional[dict]:
         """
-        Use OpenAI to find relevant Bible verses based on the query.
+        Use OpenAI to find a single relevant Bible verse.
+
+        Args:
+            query: Natural language query about a Bible verse
+
+        Returns:
+            Single verse reference with explanation, or None
+        """
+        if not self.openai_client:
+            return self._fallback_search_single(query)
+
+        try:
+            system_prompt = """You are a Bible expert assistant. When given a question or topic,
+you identify the SINGLE most relevant Bible verse.
+
+Respond ONLY with a JSON object containing:
+- "reference": The Bible reference (e.g., "Matthew 7:12", "John 3:16")
+- "reason": Brief explanation of why this verse is relevant
+
+For specific verse queries (like "the golden rule"), give the exact verse.
+If you cannot find a single specific verse that matches, respond with: {"reference": null, "reason": "No specific verse found"}
+
+Example response:
+{"reference": "Matthew 7:12", "reason": "This is the Golden Rule - treat others as you want to be treated"}
+
+Respond with ONLY the JSON object, no other text."""
+
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query}
+                ],
+                temperature=0.3,
+                max_tokens=200
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            # Handle potential markdown code blocks
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+
+            result = json.loads(content)
+            if result.get("reference"):
+                return result
+            return None
+
+        except Exception:
+            return self._fallback_search_single(query)
+
+    def search_multiple_with_ai(self, query: str) -> list[dict]:
+        """
+        Use OpenAI to find multiple relevant Bible verses.
 
         Args:
             query: Natural language query about Bible verses
@@ -106,22 +169,21 @@ class BibleSearch:
             List of verse references with explanations
         """
         if not self.openai_client:
-            return self._fallback_search(query)
+            return self._fallback_search_multiple(query)
 
         try:
             system_prompt = """You are a Bible expert assistant. When given a question or topic,
-you identify the most relevant Bible verses.
+you identify multiple relevant Bible verses.
 
 Respond ONLY with a JSON array of objects, each containing:
 - "reference": The Bible reference (e.g., "Matthew 7:12", "John 3:16-17")
 - "reason": Brief explanation of why this verse is relevant
 
-Focus on the most commonly referenced and relevant verses. Include 1-10 verses depending on the query.
-For specific verse queries (like "the golden rule"), give the exact verse(s).
-For broader topics, give multiple relevant verses.
+Include 2-10 relevant verses depending on the topic.
+If you cannot find any relevant verses, respond with: []
 
 Example response:
-[{"reference": "Matthew 7:12", "reason": "This is the Golden Rule - treat others as you want to be treated"}]
+[{"reference": "Revelation 21:1-4", "reason": "New heaven and new earth"}, {"reference": "Revelation 21:10-14", "reason": "Description of New Jerusalem"}]
 
 Respond with ONLY the JSON array, no other text."""
 
@@ -137,7 +199,6 @@ Respond with ONLY the JSON array, no other text."""
 
             content = response.choices[0].message.content.strip()
 
-            # Parse the JSON response
             # Handle potential markdown code blocks
             if content.startswith("```"):
                 content = content.split("```")[1]
@@ -145,23 +206,59 @@ Respond with ONLY the JSON array, no other text."""
                     content = content[4:]
 
             verses = json.loads(content)
-            return verses
+            return verses if verses else []
 
-        except json.JSONDecodeError as e:
-            self.print(f"[yellow]Warning: Could not parse AI response, using fallback search[/yellow]" if RICH_AVAILABLE else "Warning: Could not parse AI response, using fallback search")
-            return self._fallback_search(query)
-        except Exception as e:
-            self.print(f"[yellow]AI search error: {e}, using fallback search[/yellow]" if RICH_AVAILABLE else f"AI search error: {e}, using fallback search")
-            return self._fallback_search(query)
+        except Exception:
+            return self._fallback_search_multiple(query)
 
-    def _fallback_search(self, query: str) -> list[dict]:
-        """
-        Fallback keyword-based search when AI is not available.
-        Uses a curated database of common verse topics.
-        """
-        # Common verse database for fallback
+    def _fallback_search_single(self, query: str) -> Optional[dict]:
+        """Fallback single verse search using keyword database."""
+        # Single verse database for common specific queries
+        single_verse_database = {
+            "golden rule": {"reference": "Matthew 7:12", "reason": "The Golden Rule - do unto others"},
+            "john 3:16": {"reference": "John 3:16", "reason": "God's love for the world"},
+            "god so loved": {"reference": "John 3:16", "reason": "God's love for the world"},
+            "beginning": {"reference": "Genesis 1:1", "reason": "In the beginning God created"},
+            "faith definition": {"reference": "Hebrews 11:1", "reason": "Definition of faith"},
+            "what is faith": {"reference": "Hebrews 11:1", "reason": "Definition of faith"},
+            "love is patient": {"reference": "1 Corinthians 13:4-7", "reason": "Love is patient, love is kind"},
+            "lord is my shepherd": {"reference": "Psalm 23:1", "reason": "The Lord is my shepherd"},
+            "i can do all things": {"reference": "Philippians 4:13", "reason": "I can do all things through Christ"},
+            "fear not": {"reference": "Isaiah 41:10", "reason": "Fear not, for I am with you"},
+            "plans for you": {"reference": "Jeremiah 29:11", "reason": "Plans for hope and a future"},
+            "jeremiah 29:11": {"reference": "Jeremiah 29:11", "reason": "Plans for hope and a future"},
+            "trust in the lord": {"reference": "Proverbs 3:5-6", "reason": "Trust in the Lord with all your heart"},
+            "way truth life": {"reference": "John 14:6", "reason": "Jesus is the way, truth, and life"},
+            "do not worry": {"reference": "Matthew 6:25", "reason": "Do not worry about your life"},
+            "be strong": {"reference": "Joshua 1:9", "reason": "Be strong and courageous"},
+            "all things work together": {"reference": "Romans 8:28", "reason": "All things work together for good"},
+            "grace sufficient": {"reference": "2 Corinthians 12:9", "reason": "My grace is sufficient for you"},
+            "god is love": {"reference": "1 John 4:8", "reason": "God is love"},
+            "wages of sin": {"reference": "Romans 6:23", "reason": "Wages of sin is death"},
+            "all have sinned": {"reference": "Romans 3:23", "reason": "All have sinned"},
+            "saved by grace": {"reference": "Ephesians 2:8-9", "reason": "Saved by grace through faith"},
+            "armor of god": {"reference": "Ephesians 6:10-18", "reason": "Put on the full armor of God"},
+            "fruit of the spirit": {"reference": "Galatians 5:22-23", "reason": "Love, joy, peace, patience..."},
+            "mustard seed": {"reference": "Matthew 17:20", "reason": "Faith like a mustard seed"},
+            "lord's prayer": {"reference": "Matthew 6:9-13", "reason": "Our Father in heaven..."},
+            "our father": {"reference": "Matthew 6:9-13", "reason": "The Lord's Prayer"},
+            "resurrection and life": {"reference": "John 11:25-26", "reason": "I am the resurrection and the life"},
+            "good shepherd": {"reference": "John 10:11", "reason": "I am the good shepherd"},
+            "light of the world": {"reference": "John 8:12", "reason": "I am the light of the world"},
+            "bread of life": {"reference": "John 6:35", "reason": "I am the bread of life"},
+        }
+
+        query_lower = query.lower()
+
+        for keyword, verse in single_verse_database.items():
+            if keyword in query_lower:
+                return verse
+
+        return None
+
+    def _fallback_search_multiple(self, query: str) -> list[dict]:
+        """Fallback multiple verse search using keyword database."""
         verse_database = {
-            "golden rule": [{"reference": "Matthew 7:12", "reason": "The Golden Rule - do unto others"}],
             "love": [
                 {"reference": "1 Corinthians 13:4-7", "reason": "Love is patient, love is kind"},
                 {"reference": "John 3:16", "reason": "God's love for the world"},
@@ -266,11 +363,6 @@ Respond with ONLY the JSON array, no other text."""
                 {"reference": "Revelation 21:1-4", "reason": "New heaven and new earth"},
                 {"reference": "Philippians 3:20", "reason": "Our citizenship is in heaven"}
             ],
-            "hell": [
-                {"reference": "Matthew 25:41", "reason": "Eternal fire prepared for the devil"},
-                {"reference": "Revelation 20:10", "reason": "Lake of fire"},
-                {"reference": "Luke 16:19-31", "reason": "Rich man and Lazarus"}
-            ],
             "sin": [
                 {"reference": "Romans 3:23", "reason": "All have sinned"},
                 {"reference": "Romans 6:23", "reason": "Wages of sin is death"},
@@ -307,36 +399,10 @@ Respond with ONLY the JSON array, no other text."""
                 {"reference": "Romans 12:12", "reason": "Be patient in tribulation"},
                 {"reference": "Galatians 5:22-23", "reason": "Fruit of the Spirit includes patience"}
             ],
-            "giving": [
-                {"reference": "2 Corinthians 9:7", "reason": "God loves a cheerful giver"},
-                {"reference": "Malachi 3:10", "reason": "Bring the full tithe"},
-                {"reference": "Acts 20:35", "reason": "More blessed to give than receive"}
-            ],
-            "humility": [
-                {"reference": "Philippians 2:3-4", "reason": "Consider others more important"},
-                {"reference": "James 4:6", "reason": "God opposes the proud but gives grace to the humble"},
-                {"reference": "Proverbs 11:2", "reason": "With humility comes wisdom"}
-            ],
             "joy": [
                 {"reference": "Nehemiah 8:10", "reason": "The joy of the Lord is your strength"},
                 {"reference": "Philippians 4:4", "reason": "Rejoice in the Lord always"},
                 {"reference": "Psalm 16:11", "reason": "Fullness of joy in God's presence"}
-            ],
-            "obedience": [
-                {"reference": "John 14:15", "reason": "If you love me, keep my commandments"},
-                {"reference": "1 Samuel 15:22", "reason": "To obey is better than sacrifice"},
-                {"reference": "James 1:22", "reason": "Be doers of the word, not hearers only"}
-            ],
-            "shepherd": [
-                {"reference": "Psalm 23:1-6", "reason": "The Lord is my shepherd"},
-                {"reference": "John 10:11-14", "reason": "I am the good shepherd"},
-                {"reference": "1 Peter 5:2-4", "reason": "Shepherd the flock of God"}
-            ],
-            "armor of god": [
-                {"reference": "Ephesians 6:10-18", "reason": "Put on the full armor of God"}
-            ],
-            "fruit of the spirit": [
-                {"reference": "Galatians 5:22-23", "reason": "Love, joy, peace, patience..."}
             ],
             "beatitudes": [
                 {"reference": "Matthew 5:3-12", "reason": "Blessed are the poor in spirit..."}
@@ -344,10 +410,6 @@ Respond with ONLY the JSON array, no other text."""
             "ten commandments": [
                 {"reference": "Exodus 20:1-17", "reason": "The Ten Commandments"},
                 {"reference": "Deuteronomy 5:6-21", "reason": "Ten Commandments restated"}
-            ],
-            "lord's prayer": [
-                {"reference": "Matthew 6:9-13", "reason": "Our Father in heaven..."},
-                {"reference": "Luke 11:2-4", "reason": "Luke's version of the Lord's Prayer"}
             ],
             "christmas": [
                 {"reference": "Luke 2:1-20", "reason": "Birth of Jesus narrative"},
@@ -368,75 +430,114 @@ Respond with ONLY the JSON array, no other text."""
 
         query_lower = query.lower()
 
-        # Check for exact or partial matches
         for keyword, verses in verse_database.items():
             if keyword in query_lower:
                 return verses
 
-        # If no match found, return some helpful default verses
-        return [
-            {"reference": "Proverbs 3:5-6", "reason": "Trust in the Lord with all your heart"},
-            {"reference": "Jeremiah 29:11", "reason": "God's plans for hope and a future"},
-            {"reference": "Philippians 4:13", "reason": "I can do all things through Christ"}
-        ]
+        return []
 
-    def search(self, query: str, show_verses: bool = True):
+    def search_single(self, query: str) -> bool:
         """
-        Main search function - finds and displays relevant Bible verses.
+        Search for a single verse. If not found, falls back to multiple verses.
 
         Args:
             query: Natural language query
-            show_verses: Whether to fetch and display full verse text
-        """
-        self.print(f"\n🔍 Searching for: [bold cyan]{query}[/bold cyan]\n" if RICH_AVAILABLE else f"\n🔍 Searching for: {query}\n")
 
-        # Find relevant verses
-        results = self.search_with_ai(query)
+        Returns:
+            True if verse(s) found, False otherwise
+        """
+        self.print(f"\n🔍 Searching for single verse: [bold cyan]{query}[/bold cyan]\n" if RICH_AVAILABLE else f"\n🔍 Searching for single verse: {query}\n")
+
+        # Try to find a single verse
+        result = self.search_single_with_ai(query)
+
+        if result:
+            reference = result.get("reference")
+            reason = result.get("reason", "")
+
+            verse_data = self.fetch_verse(reference)
+
+            if verse_data:
+                text = verse_data.get("text", "Verse text not available")
+                translation = verse_data.get("translation_name", "WEB")
+
+                self.print(f"[dim]({reason})[/dim]" if RICH_AVAILABLE else f"({reason})")
+                self.print_verse(reference, text, translation)
+                return True
+            else:
+                # Verse reference found but couldn't fetch - still show reference
+                self.print(f"[dim]({reason})[/dim]" if RICH_AVAILABLE else f"({reason})")
+                self.print(f"\n📖 [bold]{reference}[/bold]" if RICH_AVAILABLE else f"\n📖 {reference}")
+                self.print("[yellow](Could not fetch verse text - check your internet connection)[/yellow]" if RICH_AVAILABLE else "(Could not fetch verse text)")
+                return True
+
+        # No single verse found, try multiple verses
+        self.print("[yellow]No single verse found. Searching for related verses...[/yellow]\n" if RICH_AVAILABLE else "No single verse found. Searching for related verses...\n")
+        return self.search_multiple(query, from_fallback=True)
+
+    def search_multiple(self, query: str, from_fallback: bool = False) -> bool:
+        """
+        Search for multiple verses on a topic.
+
+        Args:
+            query: Natural language query
+            from_fallback: Whether this was called as fallback from single search
+
+        Returns:
+            True if verses found, False otherwise
+        """
+        if not from_fallback:
+            self.print(f"\n🔍 Searching for verses about: [bold cyan]{query}[/bold cyan]\n" if RICH_AVAILABLE else f"\n🔍 Searching for verses about: {query}\n")
+
+        # Find multiple verses
+        results = self.search_multiple_with_ai(query)
 
         if not results:
-            self.print("[red]No verses found for your query.[/red]" if RICH_AVAILABLE else "No verses found for your query.")
-            return
+            self.print_error("Verse not found, please try again later")
+            return False
 
         self.print(f"Found [green]{len(results)}[/green] relevant verse(s):\n" if RICH_AVAILABLE else f"Found {len(results)} relevant verse(s):\n")
 
-        for i, result in enumerate(results, 1):
+        for result in results:
             reference = result.get("reference", "Unknown")
             reason = result.get("reason", "")
 
-            if show_verses:
-                # Fetch the actual verse text
-                verse_data = self.fetch_verse(reference)
+            verse_data = self.fetch_verse(reference)
 
-                if verse_data:
-                    text = verse_data.get("text", "Verse text not available")
-                    translation = verse_data.get("translation_name", "WEB")
+            if verse_data:
+                text = verse_data.get("text", "Verse text not available")
+                translation = verse_data.get("translation_name", "WEB")
 
-                    if RICH_AVAILABLE:
-                        self.print(f"[dim]({reason})[/dim]")
-                    else:
-                        print(f"({reason})")
-
-                    self.print_verse(reference, text, translation)
-                else:
-                    self.print(f"\n[bold]{i}. {reference}[/bold]" if RICH_AVAILABLE else f"\n{i}. {reference}")
-                    self.print(f"   [dim]{reason}[/dim]" if RICH_AVAILABLE else f"   {reason}")
-                    self.print(f"   [yellow](Could not fetch verse text)[/yellow]" if RICH_AVAILABLE else "   (Could not fetch verse text)")
+                self.print(f"[dim]({reason})[/dim]" if RICH_AVAILABLE else f"({reason})")
+                self.print_verse(reference, text, translation)
             else:
-                self.print(f"\n[bold]{i}. {reference}[/bold]" if RICH_AVAILABLE else f"\n{i}. {reference}")
+                self.print(f"\n📖 [bold]{reference}[/bold]" if RICH_AVAILABLE else f"\n📖 {reference}")
                 self.print(f"   [dim]{reason}[/dim]" if RICH_AVAILABLE else f"   {reason}")
+                self.print("[yellow](Could not fetch verse text)[/yellow]" if RICH_AVAILABLE else "(Could not fetch verse text)")
 
-        print()  # Final newline
+        return True
 
 
 def main():
     """Main entry point for the Bible search CLI."""
     bible = BibleSearch()
 
-    # Check if query provided as command line argument
+    # Check for command line arguments
     if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
-        bible.search(query)
-        return
+        mode = sys.argv[1].lower()
+        if mode in ("-s", "--single") and len(sys.argv) > 2:
+            query = " ".join(sys.argv[2:])
+            bible.search_single(query)
+            return
+        elif mode in ("-m", "--multiple") and len(sys.argv) > 2:
+            query = " ".join(sys.argv[2:])
+            bible.search_multiple(query)
+            return
+        else:
+            # Default to single search with fallback
+            query = " ".join(sys.argv[1:])
+            bible.search_single(query)
+            return
 
     # Interactive mode
     if RICH_AVAILABLE:
@@ -444,11 +545,13 @@ def main():
         console.print(Panel(
             "[bold]Bible Verse Search[/bold]\n\n"
             "Find Bible verses by asking questions or describing topics.\n\n"
-            "Examples:\n"
-            "  • What is the golden rule?\n"
-            "  • Verses about love\n"
-            "  • New Jerusalem in Revelation\n"
-            "  • Comfort for grief\n\n"
+            "[bold cyan]Two Search Modes:[/bold cyan]\n"
+            "  [green]1[/green] - Single Verse Search (finds one specific verse)\n"
+            "  [green]2[/green] - Multiple Verses Search (finds a group of verses)\n\n"
+            "[bold]Examples:[/bold]\n"
+            "  • What is the golden rule? [dim](single)[/dim]\n"
+            "  • New Jerusalem in Revelation [dim](multiple)[/dim]\n"
+            "  • Verses about love [dim](multiple)[/dim]\n\n"
             "Type [cyan]'quit'[/cyan] or [cyan]'exit'[/cyan] to stop.",
             title="📖 Welcome",
             border_style="blue"
@@ -458,20 +561,49 @@ def main():
         print("📖 Bible Verse Search")
         print("="*60)
         print("\nFind Bible verses by asking questions or describing topics.")
+        print("\nTwo Search Modes:")
+        print("  1 - Single Verse Search (finds one specific verse)")
+        print("  2 - Multiple Verses Search (finds a group of verses)")
         print("\nExamples:")
-        print("  • What is the golden rule?")
-        print("  • Verses about love")
-        print("  • New Jerusalem in Revelation")
-        print("  • Comfort for grief")
+        print("  • What is the golden rule? (single)")
+        print("  • New Jerusalem in Revelation (multiple)")
+        print("  • Verses about love (multiple)")
         print("\nType 'quit' or 'exit' to stop.")
-        print("="*60 + "\n")
+        print("="*60)
 
     while True:
         try:
+            # Get search mode
+            print()
             if RICH_AVAILABLE:
-                query = console.input("\n[bold green]Search:[/bold green] ")
+                mode = console.input("[bold yellow]Select mode ([green]1[/green]=Single, [green]2[/green]=Multiple):[/bold yellow] ")
             else:
-                query = input("\nSearch: ")
+                mode = input("Select mode (1=Single, 2=Multiple): ")
+
+            mode = mode.strip()
+
+            if mode.lower() in ("quit", "exit", "q"):
+                print("\nGoodbye! 📖\n")
+                break
+
+            if mode not in ("1", "2"):
+                if RICH_AVAILABLE:
+                    console.print("[red]Please enter 1 or 2[/red]")
+                else:
+                    print("Please enter 1 or 2")
+                continue
+
+            # Get search query
+            if RICH_AVAILABLE:
+                if mode == "1":
+                    query = console.input("[bold green]Enter your search (single verse):[/bold green] ")
+                else:
+                    query = console.input("[bold green]Enter your search (multiple verses):[/bold green] ")
+            else:
+                if mode == "1":
+                    query = input("Enter your search (single verse): ")
+                else:
+                    query = input("Enter your search (multiple verses): ")
 
             query = query.strip()
 
@@ -482,7 +614,11 @@ def main():
                 print("\nGoodbye! 📖\n")
                 break
 
-            bible.search(query)
+            # Perform search based on mode
+            if mode == "1":
+                bible.search_single(query)
+            else:
+                bible.search_multiple(query)
 
         except KeyboardInterrupt:
             print("\n\nGoodbye! 📖\n")
